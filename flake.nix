@@ -1,8 +1,6 @@
 {
-  description = "A devShell example";
-
   inputs = {
-    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-25.05";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url  = "github:numtide/flake-utils";
   };
@@ -19,11 +17,11 @@
       {
         devShells.default = mkShell {
           nativeBuildInputs = [
-            can-utils
             ffmpeg
             openssl
+            opencv
             pkg-config
-            rust-bin.nightly.latest.default
+            rust-bin.stable.latest.default
             rust-analyzer
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";

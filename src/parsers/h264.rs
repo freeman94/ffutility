@@ -16,6 +16,28 @@ use std::cell::Cell;
 use std::io::Read;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, mpsc::channel};
 
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum H264ParserError {
+    #[error("Failed to parse NAL header: {0}")]
+    NalHeaderError(String),
+    #[error("Failed to parse SPS: {0}")]
+    SpsParseError(String),
+    #[error("Failed to parse PPS: {0}")]
+    PpsParseError(String),
+    #[error("Failed to read NAL: {0}")]
+    NalReadError(String),
+    #[error("Failed to parse slice header: {0}")]
+    SliceHeaderError(String),
+    #[error("Failed to send frame: {0}")]
+    FrameSendError(String),
+    #[error("Failed to publish track: {0}")]
+    TrackPublishError(String),
+    #[error("Lock error: {0}")]
+    LockError(String),
+}
+
 pub struct AnnexBStreamImport {
     broadcast: Arc<Mutex<BroadcastProducer>>,
     codec: Option<H264>,
@@ -42,20 +64,42 @@ impl AnnexBStreamImport {
         let found_pps = AtomicBool::new(false);
 
         let mut reader = AnnexBReader::accumulate(|nal: RefNal<'_>| {
-            let nal_unit_type = nal.header().unwrap().nal_unit_type();
+            let nal_header = match nal.header() {
+                Ok(header) => header,
+                Err(e) => {
+                    tracing::error!("Failed to parse NAL header: {:?}", e);
+                    return NalInterest::Ignore;
+                }
+            };
+
+            let nal_unit_type = nal_header.nal_unit_type();
             match nal_unit_type {
                 UnitType::SeqParameterSet => {
-                    let sps_local= SeqParameterSet::from_bits(nal.rbsp_bits()).unwrap();
-                    ctx.put_seq_param_set(sps_local.clone());
-                    sps = Some(sps_local);
-                    found_sps.store(true, Ordering::SeqCst);
-                    NalInterest::Buffer
+                    match SeqParameterSet::from_bits(nal.rbsp_bits()) {
+                        Ok(sps_local) => {
+                            ctx.put_seq_param_set(sps_local.clone());
+                            sps = Some(sps_local);
+                            found_sps.store(true, Ordering::SeqCst);
+                            NalInterest::Buffer
+                        },
+                        Err(e) => {
+                            tracing::error!("Failed to parse SPS: {:?}", e);
+                            NalInterest::Ignore
+                        }
+                    }
                 },
                 UnitType::PicParameterSet => {
-                    let pps = PicParameterSet::from_bits(&ctx, nal.rbsp_bits()).unwrap();
-                    ctx.put_pic_param_set(pps);
-                    found_pps.store(true, Ordering::SeqCst);
-                    NalInterest::Buffer
+                    match PicParameterSet::from_bits(&ctx, nal.rbsp_bits()) {
+                        Ok(pps) => {
+                            ctx.put_pic_param_set(pps);
+                            found_pps.store(true, Ordering::SeqCst);
+                            NalInterest::Buffer
+                        },
+                        Err(e) => {
+                            tracing::error!("Failed to parse PPS: {:?}", e);
+                            NalInterest::Ignore
+                        }
+                    }
                 },
                 _ => NalInterest::Ignore,
             }
@@ -77,7 +121,6 @@ impl AnnexBStreamImport {
             };
             self.codec = Some(codec.clone());
 
-            // let description = BytesMut::new();
             let track = Video {
                 track: Track { name: String::from("video0"), priority: 2 },
                 resolution: Dimensions {
@@ -89,16 +132,18 @@ impl AnnexBStreamImport {
                 bitrate: None,
             };
 
-            let mut broadcast = self.broadcast.lock().unwrap();
-            let track = broadcast.publish_video(track).unwrap();
+            let mut broadcast_result = self.broadcast.lock()
+                .map_err(|e| H264ParserError::LockError(e.to_string()))?;
+
+            let track = broadcast_result.publish_video(track)
+                .map_err(|e| H264ParserError::TrackPublishError(e.to_string()))?;
+
             self.ctx = Some(ctx);
 
             Ok(track)
         } else {
             bail!("Failed to find valid SPS in input!");
         }
-
-
     }
 
     pub async fn read_from<T: Stream<Item = BytesMut> + Unpin>(&mut self, input: &mut T, track: &mut TrackProducer) -> Result<()> {
@@ -108,7 +153,8 @@ impl AnnexBStreamImport {
 
         let now = std::time::Instant::now();
 
-        let ctx = self.ctx.as_ref().unwrap();
+        let ctx = self.ctx.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Context not initialized"))?;
         // NOTE: Have to use a sync channel since I want to mutate
         // both in the AnnexBReader accumulate closure and out of the
         // closure. There is probably a better way of doing this. The
@@ -121,7 +167,15 @@ impl AnnexBStreamImport {
         let mut first_keyframe = false;
 
         let mut reader = AnnexBReader::accumulate(|nal: RefNal<'_>| {
-            let nal_unit_type = nal.header().unwrap().nal_unit_type();
+            let nal_header = match nal.header() {
+                Ok(header) => header,
+                Err(e) => {
+                    tracing::error!("Failed to parse NAL header: {:?}", e);
+                    return NalInterest::Ignore;
+                }
+            };
+
+            let nal_unit_type = nal_header.nal_unit_type();
             match nal_unit_type {
                 UnitType::PicParameterSet => {
                     if nal.is_complete() {
@@ -129,7 +183,13 @@ impl AnnexBStreamImport {
                         let mut full_nal_buf = BytesMut::new();
                         let mut buf = [0u8; 1024];
                         loop {
-                            let n = nal_reader.read(&mut buf).unwrap();
+                            let n = match nal_reader.read(&mut buf) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::error!("Failed to read NAL: {}", e);
+                                    break;
+                                }
+                            };
                             if n == 0 {
                                 break
                             } else {
@@ -146,7 +206,13 @@ impl AnnexBStreamImport {
                         let mut full_nal_buf = BytesMut::new();
                         let mut buf = [0u8; 1024];
                         loop {
-                            let n = nal_reader.read(&mut buf).unwrap();
+                            let n = match nal_reader.read(&mut buf) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::error!("Failed to read NAL: {}", e);
+                                    break;
+                                }
+                            };
                             if n == 0 {
                                 break
                             } else {
@@ -162,14 +228,34 @@ impl AnnexBStreamImport {
                     if nal.is_complete() && first_keyframe {
                         let ts = now.elapsed().as_micros();
 
-                        let slice_header = SliceHeader::from_bits(&ctx, &mut nal.rbsp_bits(), nal.header().unwrap()).unwrap().0;
+                        let nal_header = match nal.header() {
+                            Ok(header) => header,
+                            Err(e) => {
+                                tracing::error!("Failed to parse NAL header: {:?}", e);
+                                return NalInterest::Ignore;
+                            }
+                        };
+
+                        let slice_header = match SliceHeader::from_bits(ctx, &mut nal.rbsp_bits(), nal_header) {
+                            Ok((header, _, _)) => header,
+                            Err(e) => {
+                                tracing::error!("Failed to parse slice header: {:?}", e);
+                                return NalInterest::Ignore;
+                            }
+                        };
                         let keyframe = slice_header.slice_type.family == SliceFamily::I;
 
                         let mut nal_reader = nal.reader();
                         let mut full_nal_buf = BytesMut::new();
                         let mut buf = [0u8; 1024];
                         loop {
-                            let n = nal_reader.read(&mut buf).unwrap();
+                            let n = match nal_reader.read(&mut buf) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::error!("Failed to read NAL: {}", e);
+                                    break;
+                                }
+                            };
                             if n == 0 {
                                 break
                             } else {
@@ -186,15 +272,17 @@ impl AnnexBStreamImport {
                                 keyframe,
                                 payload: payload.freeze(),
                             };
-                            frame_tx.send(frame).unwrap();
+                            if let Err(e) = frame_tx.send(frame) {
+                                tracing::error!("Failed to send frame: {}", e);
+                            };
                         } else if keyframe && !pps.get_mut().is_empty() && !sps.get_mut().is_empty() {
                             let sps = sps.get_mut();
                             let pps = pps.get_mut();
                             let mut payload = BytesMut::new();
                             payload.extend_from_slice(&[0u8, 0u8, 0u8, 1u8]);
-                            payload.extend_from_slice(&sps);
+                            payload.extend_from_slice(sps);
                             payload.extend_from_slice(&[0u8, 0u8, 0u8, 1u8]);
-                            payload.extend_from_slice(&pps);
+                            payload.extend_from_slice(pps);
                             payload.extend_from_slice(&[0u8, 0u8, 0u8, 1u8]);
                             payload.extend_from_slice(&full_nal_buf);
                             let frame = Frame {
@@ -202,7 +290,9 @@ impl AnnexBStreamImport {
                                 keyframe,
                                 payload: payload.freeze(),
                             };
-                            frame_tx.send(frame).unwrap();
+                            if let Err(e) = frame_tx.send(frame) {
+                                tracing::error!("Failed to send frame: {}", e);
+                            };
                         }
                     }
                     NalInterest::Buffer
@@ -217,7 +307,13 @@ impl AnnexBStreamImport {
                         let mut full_nal_buf = BytesMut::new();
                         let mut buf = [0u8; 1024];
                         loop {
-                            let n = nal_reader.read(&mut buf).unwrap();
+                            let n = match nal_reader.read(&mut buf) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::error!("Failed to read NAL: {}", e);
+                                    break;
+                                }
+                            };
                             if n == 0 {
                                 break
                             } else {
@@ -229,9 +325,9 @@ impl AnnexBStreamImport {
                         let pps = pps.get_mut();
                         let mut payload = BytesMut::new();
                         payload.extend_from_slice(&[0u8, 0u8, 0u8, 1u8]);
-                        payload.extend_from_slice(&sps);
+                        payload.extend_from_slice(sps);
                         payload.extend_from_slice(&[0u8, 0u8, 0u8, 1u8]);
-                        payload.extend_from_slice(&pps);
+                        payload.extend_from_slice(pps);
                         payload.extend_from_slice(&[0u8, 0u8, 0u8, 1u8]);
                         payload.extend_from_slice(&full_nal_buf);
 
@@ -240,7 +336,9 @@ impl AnnexBStreamImport {
                             keyframe: true,
                             payload: payload.freeze(),
                         };
-                        frame_tx.send(frame).unwrap();
+                        if let Err(e) = frame_tx.send(frame) {
+                                tracing::error!("Failed to send frame: {}", e);
+                            };
                     }
                     NalInterest::Buffer
                 },
