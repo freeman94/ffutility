@@ -1,3 +1,11 @@
+/*! 
+H.264 video stream parsing module.
+
+This module provides functionality for parsing H.264 video streams in Annex B format
+and integrating them with MoQ streaming protocol. It extracts SPS/PPS metadata and
+handles both keyframes and regular frames.
+*/
+
 use anyhow::{Result, bail};
 
 use bytes::BytesMut;
@@ -18,35 +26,57 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, mpsc::channel};
 
 use thiserror::Error;
 
+/// Errors that can occur during H.264 parsing operations
 #[derive(Error, Debug)]
 pub enum H264ParserError {
+    /// Error parsing NAL unit header
     #[error("Failed to parse NAL header: {0}")]
     NalHeaderError(String),
+    /// Error parsing Sequence Parameter Set
     #[error("Failed to parse SPS: {0}")]
     SpsParseError(String),
+    /// Error parsing Picture Parameter Set
     #[error("Failed to parse PPS: {0}")]
     PpsParseError(String),
+    /// Error reading NAL unit data
     #[error("Failed to read NAL: {0}")]
     NalReadError(String),
+    /// Error parsing slice header
     #[error("Failed to parse slice header: {0}")]
     SliceHeaderError(String),
+    /// Error sending frame to MoQ track
     #[error("Failed to send frame: {0}")]
     FrameSendError(String),
+    /// Error publishing MoQ track
     #[error("Failed to publish track: {0}")]
     TrackPublishError(String),
+    /// Error acquiring mutex lock
     #[error("Lock error: {0}")]
     LockError(String),
 }
 
+/// Parser for H.264 video streams in Annex B format that integrates with MoQ streaming
 pub struct AnnexBStreamImport {
+    /// MoQ broadcast producer for sending frames
     broadcast: Arc<Mutex<BroadcastProducer>>,
+    /// H.264 codec configuration extracted from the stream
     codec: Option<H264>,
+    /// H.264 parsing context with SPS/PPS state
     ctx: Option<Context>,
+    /// Width of the video stream in pixels
     width: u32,
+    /// Height of the video stream in pixels
     height: u32,
 }
 
 impl AnnexBStreamImport {
+    /// Creates a new Annex B stream parser with the specified broadcast producer and dimensions
+    ///
+    /// # Arguments
+    ///
+    /// * `broadcast` - MoQ broadcast producer for sending frames
+    /// * `width` - Width of the video stream in pixels
+    /// * `height` - Height of the video stream in pixels
     pub fn new(broadcast: Arc<Mutex<BroadcastProducer>>, width: u32, height: u32) -> Self {
         Self {
             broadcast,
@@ -57,6 +87,16 @@ impl AnnexBStreamImport {
         }
     }
 
+    /// Initializes the stream parser by extracting SPS/PPS from the input stream
+    /// and creating a MoQ track
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Stream of H.264 Annex B data
+    ///
+    /// # Returns
+    ///
+    /// A TrackProducer for the video stream if initialization succeeds
     pub async fn init_from<T: Stream<Item = BytesMut> + Unpin>(&mut self, input: &mut T) -> Result<TrackProducer> {
         let mut ctx = Context::new();
         let mut sps: Option<SeqParameterSet> = None;
@@ -146,6 +186,18 @@ impl AnnexBStreamImport {
         }
     }
 
+    /// Processes an H.264 stream, extracting frames and sending them to the MoQ track
+    ///
+    /// This method should be called after successful initialization with `init_from`.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Stream of H.264 Annex B data
+    /// * `track` - MoQ track to send frames to
+    ///
+    /// # Returns
+    ///
+    /// Result indicating success or error
     pub async fn read_from<T: Stream<Item = BytesMut> + Unpin>(&mut self, input: &mut T, track: &mut TrackProducer) -> Result<()> {
         if self.ctx.is_none() || self.codec.is_none() {
             bail!("AnnexBImport not initialized");
